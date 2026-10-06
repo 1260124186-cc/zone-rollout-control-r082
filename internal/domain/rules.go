@@ -93,12 +93,27 @@ func NewAllocationPlan(
 }
 
 // Commit materializes the prepared allocation as leases, node claims and a
-// stored request index for the supplied state.
+// stored request index for the supplied state. Every precondition is checked
+// against the state being committed, so the allocation succeeds only if it is
+// still valid at the exact commit instant; the transaction is aborted without
+// touching anything otherwise.
 func (p AllocationPlan) Commit(state *State) (LeaseGroup, error) {
 	requestIndex := p.PlanID + "\x00" + p.RequestKey
 	if _, exists := state.LeaseRequestKeys[requestIndex]; exists {
 		return LeaseGroup{}, NewError(CodeIdempotencyConflict, "lease request key was already committed", map[string]any{
 			"request_key": p.RequestKey,
+		})
+	}
+	plan, ok := state.Plans[p.PlanID]
+	if !ok {
+		return LeaseGroup{}, NewError(CodeStorageFailure, "allocation plan references a missing plan", map[string]any{
+			"plan_id": p.PlanID,
+		})
+	}
+	if plan.State != PlanActive {
+		return LeaseGroup{}, InvalidState("plan must be active to claim leases", map[string]any{
+			"plan_id": p.PlanID,
+			"state":   plan.State,
 		})
 	}
 	leaseIDs := make([]string, 0, len(p.Nodes))
@@ -107,6 +122,16 @@ func (p AllocationPlan) Commit(state *State) (LeaseGroup, error) {
 		if !ok {
 			return LeaseGroup{}, NewError(CodeStorageFailure, "allocation plan references a missing node", map[string]any{
 				"node_id": node.ID,
+			})
+		}
+		// A node selected earlier may already have been claimed by another
+		// allocation. Refuse the double claim so one node never carries two
+		// active leases; the surrounding transaction aborts without partial
+		// leases because this runs on its private state copy.
+		if stored.State != NodeReady {
+			return LeaseGroup{}, NewError(CodeNodeUnavailable, "node is no longer ready for leasing", map[string]any{
+				"node_id": stored.ID,
+				"state":   stored.State,
 			})
 		}
 		stored.State = NodeLeased
