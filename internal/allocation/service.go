@@ -32,14 +32,39 @@ func (s *Service) Allocate(
 	input.Region = strings.TrimSpace(strings.ToLower(input.Region))
 	requestIndex := planID + "\x00" + input.RequestKey
 	fingerprint := domain.LeaseFingerprint(planID, input)
-	now := s.clock.Now().UTC()
-	var group domain.LeaseGroup
 
-	var candidates []domain.ResolverNode
+	// Idempotent replays carry no state change and can be served from a read
+	// view; every other outcome is decided inside a single write transaction
+	// so that candidate selection and commit observe the same committed state.
+	var group domain.LeaseGroup
 	err := s.store.Read(ctx, func(state *domain.State) error {
-		if _, ok := state.Plans[planID]; !ok {
-			return domain.NotFound("plan", planID)
+		if existingID, exists := state.LeaseRequestKeys[requestIndex]; exists {
+			existing, found := state.LeaseGroups[existingID]
+			if !found {
+				return domain.NewError(domain.CodeStorageFailure, "lease request index is inconsistent", map[string]any{
+					"lease_group_id": existingID,
+				})
+			}
+			if existing.RequestFingerprint != fingerprint {
+				return domain.NewError(domain.CodeIdempotencyConflict, "request key was reused with different lease parameters", map[string]any{
+					"request_key": input.RequestKey,
+				})
+			}
+			group = existing
 		}
+		return nil
+	})
+	if err != nil {
+		return domain.LeaseGroup{}, err
+	}
+	if group.ID != "" {
+		return group, nil
+	}
+
+	now := s.clock.Now().UTC()
+	err = s.store.Write(ctx, func(state *domain.State) error {
+		// A concurrent transaction may have committed this request key after
+		// the read above: its result always wins and must be replayed.
 		if existingID, exists := state.LeaseRequestKeys[requestIndex]; exists {
 			existing, found := state.LeaseGroups[existingID]
 			if !found {
@@ -55,43 +80,45 @@ func (s *Service) Allocate(
 			group = existing
 			return nil
 		}
-		candidates = fleet.SelectForLease(state, input.Region, input.MaxNodes)
-		return nil
-	})
-	if err != nil {
-		return domain.LeaseGroup{}, err
-	}
-	if group.ID != "" {
-		return group, nil
-	}
-	if len(candidates) == 0 {
-		return domain.LeaseGroup{}, domain.NewError(domain.CodeNodeUnavailable, "no eligible node is ready", map[string]any{
-			"plan_id": planID,
-			"region":  input.Region,
-		})
-	}
-
-	groupID := s.ids.New("grp")
-	leaseIDs := make([]string, 0, len(candidates))
-	for range candidates {
-		leaseIDs = append(leaseIDs, s.ids.New("lse"))
-	}
-	allocation, err := domain.NewAllocationPlan(
-		planID,
-		groupID,
-		input.RequestKey,
-		fingerprint,
-		input.Region,
-		input.LeaseSeconds,
-		candidates,
-		leaseIDs,
-		now,
-	)
-	if err != nil {
-		return domain.LeaseGroup{}, err
-	}
-	err = s.store.Write(ctx, func(state *domain.State) error {
+		plan, ok := state.Plans[planID]
+		if !ok {
+			return domain.NotFound("plan", planID)
+		}
+		// Re-check at commit time: a plan completed (or otherwise leaving the
+		// active state) concurrently must not receive any new leases.
+		if plan.State != domain.PlanActive {
+			return domain.InvalidState("plan must be active to allocate leases", map[string]any{
+				"plan_id": planID,
+				"state":   plan.State,
+			})
+		}
 		expireLeases(state, now)
+		candidates := fleet.SelectForLease(state, input.Region, input.MaxNodes)
+		if len(candidates) == 0 {
+			return domain.NewError(domain.CodeNodeUnavailable, "no eligible node is ready", map[string]any{
+				"plan_id": planID,
+				"region":  input.Region,
+			})
+		}
+		groupID := s.ids.New("grp")
+		leaseIDs := make([]string, 0, len(candidates))
+		for range candidates {
+			leaseIDs = append(leaseIDs, s.ids.New("lse"))
+		}
+		allocation, allocationErr := domain.NewAllocationPlan(
+			planID,
+			groupID,
+			input.RequestKey,
+			fingerprint,
+			input.Region,
+			input.LeaseSeconds,
+			candidates,
+			leaseIDs,
+			now,
+		)
+		if allocationErr != nil {
+			return allocationErr
+		}
 		committed, commitErr := allocation.Commit(state)
 		if commitErr != nil {
 			return commitErr

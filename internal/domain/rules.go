@@ -109,6 +109,15 @@ func (p AllocationPlan) Commit(state *State) (LeaseGroup, error) {
 				"node_id": node.ID,
 			})
 		}
+		// Only a ready node can accept a claim. Candidates are selected before
+		// the commit transaction, so a node taken by another allocation must be
+		// rejected here instead of receiving a second active lease.
+		if stored.State != NodeReady {
+			return LeaseGroup{}, NewError(CodeNodeUnavailable, "node is no longer ready for leasing", map[string]any{
+				"node_id": stored.ID,
+				"state":   stored.State,
+			})
+		}
 		stored.State = NodeLeased
 		stored.Version++
 		stored.UpdatedAt = p.At
